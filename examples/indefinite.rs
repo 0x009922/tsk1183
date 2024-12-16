@@ -54,7 +54,11 @@ fn main() {
             .run()
         });
 
-        consume_loop(&mut reader, notify_new_records.1);
+        SortedOutputListenLoop {
+            reader: &mut reader,
+            notify_new_records: notify_new_records.1,
+        }
+        .run();
     })
 }
 
@@ -134,26 +138,5 @@ fn produce_loop(
         println!("produced {emit_count} data in various channels");
 
         std::thread::sleep(TICK);
-    }
-}
-
-fn consume_loop(
-    reader: &mut output::Reader,
-    notify_new_records: mpsc::Receiver<NewRecordsAvailable>,
-) {
-    while let Ok(NewRecordsAvailable(count)) = notify_new_records.recv() {
-        println!("reading next {count} records, ensuring their proper order");
-        let mut prev = reader
-            .read()
-            .expect("must be available, count is non-zero")
-            .timestamp();
-        for _ in 1..count.get() {
-            let record = reader.read().expect("must be available");
-
-            let ts = record.timestamp();
-            assert!(ts >= prev);
-            prev = ts;
-        }
-        println!("records order is fine!");
     }
 }

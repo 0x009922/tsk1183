@@ -1,3 +1,8 @@
+//! The main part of the solution is [`UnsortedDataSinkLoop`].
+//! [`SortedOutputListenLoop`] serves merely as an example of a reader.
+//!
+//! - [`UnsortedDataSinkLoop`]: this is a process of listening for five incoming channels
+
 use std::num::NonZero;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -6,6 +11,16 @@ use std::sync::mpsc;
 /// Buffering of records.
 mod buffer;
 /// Program data model.
+///
+/// The five data structures are with a [`Timestamp`] and some other data are:
+///
+/// - [`DataA`]
+/// - [`DataB`]
+/// - [`DataC`]
+/// - [`DataD`]
+/// - [`DataE`]
+///
+/// They are unified in a single [`Record`] enum.
 pub mod data;
 /// Simple abstractions for working with the output file, both from writing and reading ends.
 pub mod output;
@@ -63,7 +78,7 @@ impl<'w, P: AsRef<Path>> UnsortedDataSinkLoop<'w, P> {
                 buffer.push_record(record);
 
                 if let Some(ts) = find_earliest_timestamp(last_timestamps.into_iter()) {
-                    let buffer::DumpedCount(count) = buffer.try_dump(ts);
+                    let buffer::DumpedCount(count) = buffer.dump_safe(ts);
                     if let Some(count) = NonZero::new(count) {
                         if let Err(_) = self.notify_new_records.send(NewRecordsAvailable(count)) {
                             break;
@@ -97,8 +112,8 @@ fn channel_data_as_record<T: Into<Record>>(rx: mpsc::Receiver<T>, tx: mpsc::Send
 }
 
 pub struct SortedOutputListenLoop<'r> {
-    reader: &'r mut output::Reader,
-    notify_new_records: mpsc::Receiver<NewRecordsAvailable>,
+    pub reader: &'r mut output::Reader,
+    pub notify_new_records: mpsc::Receiver<NewRecordsAvailable>,
 }
 
 impl<'r> SortedOutputListenLoop<'r> {

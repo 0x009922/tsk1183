@@ -2,6 +2,7 @@ use crate::data::*;
 use crate::output;
 use std::path::{Path, PathBuf};
 
+/// In-memory part of buffering
 mod in_memory {
     use super::on_disk::FileStorage;
     use super::*;
@@ -67,9 +68,6 @@ mod on_disk {
     ///
     /// It reads data in predefined small chunks, allowing to have a multitude of [`FileStorage`] buffers and
     /// to implement merge-sort efficiently in terms of RAM.
-    ///
-    /// TODO: buffer capacity is now fixed, which could cause problems if the amount of buffers is too large.
-    ///     A dynamic capacity could be used in this case, which I am not going to implement here.
     #[derive(Debug)]
     pub struct FileStorage {
         file: Option<File>,
@@ -79,6 +77,7 @@ mod on_disk {
     }
 
     impl FileStorage {
+        /// Create by draining the heap into the file
         pub fn new(heap: &mut BinaryHeap<Reverse<Record>>, file: impl AsRef<Path>) -> Option<Self> {
             let Some(non_zero_len) = NonZero::new(heap.len()) else {
                 return None;
@@ -107,6 +106,7 @@ mod on_disk {
             })
         }
 
+        /// Create a reader
         pub fn read(self, capacity: usize) -> FileStorageReader {
             FileStorageReader::new(self, capacity)
         }
@@ -116,6 +116,7 @@ mod on_disk {
         }
     }
 
+    /// Performs reading from the file buffer in merge-sort-friendly way.
     #[derive(Debug)]
     pub struct FileStorageReader {
         storage: FileStorage,
@@ -151,10 +152,14 @@ mod on_disk {
             reader
         }
 
+        /// Last record in the file, i.e. the earliest in this file so far.
+        ///
+        /// [`Self::read_next`] moves to the next one (if there is).
         pub fn last(&self) -> Option<&Record> {
             self.last.as_ref().map(|x| &x.record)
         }
 
+        /// Read the next record (if there is), changing the result of [`Self::last`]
         pub fn read_next(&mut self) {
             if self.last.is_some() {
                 self.storage.remaining -= 1;
@@ -172,6 +177,8 @@ mod on_disk {
             }
         }
 
+        /// Close the reader. The next call to [`FileStorage::read`] will resume from the same
+        /// position.
         pub fn close(mut self) -> FileStorage {
             let mut file = self.buffer.buf_reader.into_inner();
             file.seek(SeekFrom::Start(
@@ -208,6 +215,10 @@ pub struct Config {
     pub file_read_buf_capacity: usize,
 }
 
+/// _The_ buffer.
+///
+/// It accepts records via [`Buffer::push_record`], and dumps them based on the safe timestamp
+/// with [`Buffer::dump_safe`].
 #[derive(Debug)]
 pub(crate) struct Buffer<'w> {
     in_memory: in_memory::Buffer,
@@ -234,6 +245,7 @@ impl<'w> Buffer<'w> {
         }
     }
 
+    /// Push a new record into the buffer.
     pub fn push_record(&mut self, record: Record) {
         let ts = record.timestamp();
         self.earliest_buffered_timestamp.replace(
@@ -262,7 +274,8 @@ impl<'w> Buffer<'w> {
         self.files.push(file);
     }
 
-    pub fn try_dump(&mut self, safe_to_dump_timestamp: Timestamp) -> DumpedCount {
+    /// Dump the records that are safe to dump. It could as well be none!
+    pub fn dump_safe(&mut self, safe_to_dump_timestamp: Timestamp) -> DumpedCount {
         let has_something_to_dump = self
             .earliest_buffered_timestamp
             .map(|ts| ts <= safe_to_dump_timestamp)
@@ -330,6 +343,7 @@ impl<'w> Buffer<'w> {
     }
 }
 
+/// The number of dumped records
 pub(crate) struct DumpedCount(pub usize);
 
 #[cfg(test)]
@@ -444,7 +458,7 @@ mod tests {
             foo: "foo".to_owned(),
         }));
 
-        let DumpedCount(count) = sut.try_dump(Timestamp(10));
+        let DumpedCount(count) = sut.dump_safe(Timestamp(10));
         assert_eq!(count, 3);
 
         assert_eq!(reader.read().unwrap().timestamp(), Timestamp(1));
@@ -481,7 +495,7 @@ mod tests {
             sut.push_record(record);
         }
 
-        let count = sut.try_dump(Timestamp(RECORDS as u128));
+        let count = sut.dump_safe(Timestamp(RECORDS as u128));
         assert_eq!(count.0, RECORDS);
 
         let mut reader = output::Reader::open(&output).unwrap();
