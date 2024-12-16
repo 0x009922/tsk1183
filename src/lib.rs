@@ -75,10 +75,11 @@ impl<'w, P: AsRef<Path>> UnsortedDataSinkLoop<'w, P> {
                 };
                 last_timestamps[idx] = Some(record.timestamp());
 
-                buffer.push_record(record);
+                buffer.push_record(record).expect("push should not fail");
 
                 if let Some(ts) = find_earliest_timestamp(last_timestamps.into_iter()) {
-                    let buffer::DumpedCount(count) = buffer.dump_safe(ts);
+                    let buffer::DumpedCount(count) =
+                        buffer.dump_safe(ts).expect("dump should not fail");
                     if let Some(count) = NonZero::new(count) {
                         if let Err(_) = self.notify_new_records.send(NewRecordsAvailable(count)) {
                             break;

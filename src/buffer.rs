@@ -46,7 +46,10 @@ mod in_memory {
         /// Returns [`None`] if there are no records.
         ///
         /// Empties the in-memory buffer.
-        pub fn drain_into_file(&mut self, file: impl AsRef<Path>) -> Option<FileStorage> {
+        pub fn drain_into_file(
+            &mut self,
+            file: impl AsRef<Path>,
+        ) -> std::io::Result<Option<FileStorage>> {
             FileStorage::new(&mut self.heap, file)
         }
     }
@@ -77,37 +80,42 @@ mod on_disk {
     }
 
     impl FileStorage {
-        /// Create by draining the heap into the file
-        pub fn new(heap: &mut BinaryHeap<Reverse<Record>>, file: impl AsRef<Path>) -> Option<Self> {
+        /// Create by draining the heap into the file.
+        ///
+        /// Returns [`None`] if the heap is empty.
+        ///
+        /// TODO: make non-empty heap newtype?
+        pub fn new(
+            heap: &mut BinaryHeap<Reverse<Record>>,
+            file: impl AsRef<Path>,
+        ) -> std::io::Result<Option<Self>> {
             let Some(non_zero_len) = NonZero::new(heap.len()) else {
-                return None;
+                return Ok(None);
             };
 
             let file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .read(true)
-                .open(file)
-                .expect("should open");
+                .open(file)?;
 
             let mut writer = BufWriter::new(file);
 
             while let Some(item) = heap.pop() {
-                bincode::serialize_into(&mut writer, &item).expect("should serialize");
+                bincode::serialize_into(&mut writer, &item).map_err(unwrap_bincode_io_error)?;
             }
 
-            // writer.flush().expect("should flush");
-            let mut file = writer.into_inner().unwrap();
-            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut file = writer.into_inner().map_err(|err| err.into_error())?;
+            file.seek(SeekFrom::Start(0))?;
 
-            Some(Self {
+            Ok(Some(Self {
                 file: Some(file),
                 remaining: non_zero_len.get(),
-            })
+            }))
         }
 
         /// Create a reader
-        pub fn read(self, capacity: usize) -> FileStorageReader {
+        pub fn read(self, capacity: usize) -> std::io::Result<FileStorageReader> {
             FileStorageReader::new(self, capacity)
         }
 
@@ -131,14 +139,14 @@ mod on_disk {
     }
 
     impl FileStorageReader {
-        fn new(mut storage: FileStorage, capacity: usize) -> Self {
+        fn new(mut storage: FileStorage, capacity: usize) -> std::io::Result<Self> {
             let mut file = storage
                 .file
                 .take()
                 .expect("this method is only called when there is some file");
-            let bytes_read = file
-                .seek(SeekFrom::Current(0))
-                .expect("zero seeking could fail?") as usize;
+            let bytes_read =
+                file.seek(SeekFrom::Current(0))
+                    .expect("zero seeking couldn't fail, could it?") as usize;
             let buf_reader = BufReader::with_capacity(capacity, file);
             let mut reader = Self {
                 storage,
@@ -148,8 +156,8 @@ mod on_disk {
                 },
                 last: None,
             };
-            reader.read_next();
-            reader
+            reader.read_next()?;
+            Ok(reader)
         }
 
         /// Last record in the file, i.e. the earliest in this file so far.
@@ -160,50 +168,59 @@ mod on_disk {
         }
 
         /// Read the next record (if there is), changing the result of [`Self::last`]
-        pub fn read_next(&mut self) {
+        pub fn read_next(&mut self) -> std::io::Result<()> {
             if self.last.is_some() {
                 self.storage.remaining -= 1;
             }
 
             self.last = if !self.storage.is_empty() {
                 let bytes_before = self.buffer.bytes_read;
-                let record = bincode::deserialize_from(&mut self.buffer).expect(
-                    "the file is not yet read fully, and it has a sequence of valid serialised records",
-                );
+                let record =
+                    bincode::deserialize_from(&mut self.buffer).map_err(unwrap_bincode_io_error)?;
                 let bytes_read = self.buffer.bytes_read - bytes_before;
                 Some(LastRead { record, bytes_read })
             } else {
                 None
-            }
+            };
+
+            Ok(())
         }
 
         /// Close the reader. The next call to [`FileStorage::read`] will resume from the same
         /// position.
-        pub fn close(mut self) -> FileStorage {
+        pub fn close(mut self) -> std::io::Result<FileStorage> {
             let mut file = self.buffer.buf_reader.into_inner();
             file.seek(SeekFrom::Start(
                 self.last.map_or(self.buffer.bytes_read, |x| {
                     self.buffer.bytes_read - x.bytes_read
                 }) as u64,
-            ))
-            .expect("shouldn't fail?");
+            ))?;
             self.storage.file = Some(file);
-            self.storage
+            Ok(self.storage)
         }
     }
 
+    /// Needed to track the exact number of bytes [`bincode`] reads.
     #[derive(Debug)]
     struct WrappedBufReader<T> {
         bytes_read: usize,
         buf_reader: BufReader<T>,
     }
 
+    // TODO: implement more methods, forwarding them to the actual `BufReader`, for efficiency
     impl<T: Read> Read for WrappedBufReader<T> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let bytes = self.buf_reader.read(buf)?;
             self.bytes_read += bytes;
             Ok(bytes)
         }
+    }
+}
+
+fn unwrap_bincode_io_error(err: Box<bincode::ErrorKind>) -> std::io::Error {
+    match *err {
+        bincode::ErrorKind::Io(err) => err,
+        other => panic!("intentionally not covering serialisation errors in this task: {other}"),
     }
 }
 
@@ -225,6 +242,7 @@ pub(crate) struct Buffer<'w> {
     files: Vec<on_disk::FileStorage>,
     files_counter: usize,
     files_dir: PathBuf,
+    file_read_buf_capacity: usize,
     earliest_buffered_timestamp: Option<Timestamp>,
     output: &'w mut output::Writer,
 }
@@ -233,20 +251,24 @@ impl<'w> Buffer<'w> {
     pub fn new(
         files_dir: impl AsRef<Path>,
         output: &'w mut output::Writer,
-        config: Config,
+        Config {
+            max_in_memory,
+            file_read_buf_capacity,
+        }: Config,
     ) -> Self {
         Self {
-            in_memory: in_memory::Buffer::with_capacity(config.max_in_memory),
+            in_memory: in_memory::Buffer::with_capacity(max_in_memory),
             files: vec![],
             files_counter: 0,
             files_dir: files_dir.as_ref().to_path_buf(),
+            file_read_buf_capacity,
             earliest_buffered_timestamp: None,
             output,
         }
     }
 
     /// Push a new record into the buffer.
-    pub fn push_record(&mut self, record: Record) {
+    pub fn push_record(&mut self, record: Record) -> std::io::Result<()> {
         let ts = record.timestamp();
         self.earliest_buffered_timestamp.replace(
             self.earliest_buffered_timestamp
@@ -255,38 +277,42 @@ impl<'w> Buffer<'w> {
 
         self.in_memory.push(record);
         if self.in_memory.is_full() {
-            self.dump_in_memory();
+            self.dump_in_memory()?;
         }
+
+        Ok(())
     }
 
-    fn dump_in_memory(&mut self) {
+    fn dump_in_memory(&mut self) -> std::io::Result<()> {
         // FIXME not nice code
+
         if self.in_memory.len() == 0 {
-            return;
+            return Ok(());
         };
         let id = self.files_counter;
         self.files_counter += 1;
         eprintln!("dumping in-memory (#{id})");
         let file = self
             .in_memory
-            .drain_into_file(self.files_dir.join(format!("dump-{id}")))
+            .drain_into_file(self.files_dir.join(format!("dump-{id}")))?
             .expect("in-memory isn't empty");
         self.files.push(file);
+        Ok(())
     }
 
     /// Dump the records that are safe to dump. It could as well be none!
-    pub fn dump_safe(&mut self, safe_to_dump_timestamp: Timestamp) -> DumpedCount {
+    pub fn dump_safe(&mut self, safe_to_dump_timestamp: Timestamp) -> std::io::Result<DumpedCount> {
         let has_something_to_dump = self
             .earliest_buffered_timestamp
             .map(|ts| ts <= safe_to_dump_timestamp)
             .unwrap_or(false);
         if !has_something_to_dump {
-            return DumpedCount(0);
+            return Ok(DumpedCount(0));
         };
 
         // we will perform merge-sort only with files
         // FIXME: avoid this and use in-memory buffer alongside with file buffers
-        self.dump_in_memory();
+        self.dump_in_memory()?;
 
         let mut dumped = 0;
 
@@ -294,9 +320,8 @@ impl<'w> Buffer<'w> {
         let mut readers: Vec<_> = self
             .files
             .drain(0..)
-            // FIXME: document why
-            .map(|x| x.read(8_192))
-            .collect();
+            .map(|x| x.read(self.file_read_buf_capacity))
+            .collect::<Result<Vec<_>, _>>()?;
         loop {
             let reader_with_earliest_timestamp = readers
                 .iter_mut()
@@ -316,9 +341,8 @@ impl<'w> Buffer<'w> {
                 }
 
                 // dump the record
-                // FIXME unwrap
-                self.output.write(&record).unwrap();
-                reader.read_next();
+                self.output.write(&record)?;
+                reader.read_next()?;
                 dumped += 1;
             } else {
                 // all readers are empty
@@ -326,20 +350,19 @@ impl<'w> Buffer<'w> {
                 break;
             }
         }
-        // FIXME unwrap
-        self.output.flush().unwrap();
+        self.output.flush()?;
 
         // close the readers
-        self.files.extend(readers.into_iter().filter_map(|reader| {
-            let file = reader.close();
-            if file.is_empty() {
-                None
-            } else {
-                Some(file)
-            }
-        }));
+        self.files = readers
+            .into_iter()
+            .filter_map(|reader| match reader.close() {
+                Err(err) => Some(Err(err)),
+                Ok(file) if file.is_empty() => None,
+                Ok(file) => Some(Ok(file)),
+            })
+            .collect::<Result<_, _>>()?;
 
-        DumpedCount(dumped)
+        Ok(DumpedCount(dumped))
     }
 }
 
@@ -376,42 +399,44 @@ mod tests {
         }
 
         #[test]
-        fn dump_in_memory_and_read_from_disk() {
+        fn dump_in_memory_and_read_from_disk() -> std::io::Result<()> {
             let mut in_memory = in_memory_factory();
             let file = tempfile::NamedTempFile::new().unwrap();
 
             let file = in_memory
-                .drain_into_file(file.path())
+                .drain_into_file(file.path())?
                 .expect("in-memory isn't empty");
-            let mut reader = file.read(8_192);
+            let mut reader = file.read(8_192)?;
 
             assert_eq!(in_memory.len(), 0);
             assert_eq!(reader.last().unwrap().timestamp(), Timestamp(2));
 
-            reader.read_next();
+            reader.read_next()?;
             assert_eq!(reader.last().unwrap().timestamp(), Timestamp(5));
 
-            reader.read_next();
+            reader.read_next()?;
             assert_eq!(reader.last().unwrap().timestamp(), Timestamp(10));
 
-            reader.read_next();
+            reader.read_next()?;
             assert!(reader.last().is_none());
 
-            let file = reader.close();
+            let file = reader.close()?;
             assert!(file.is_empty());
+
+            Ok(())
         }
 
         #[test]
-        fn reading_same_record_from_disk_repeatedly() {
+        fn reading_same_record_from_disk_repeatedly() -> std::io::Result<()> {
             let mut in_memory = in_memory_factory();
             let file = tempfile::NamedTempFile::new().unwrap();
 
             let mut file = in_memory
-                .drain_into_file(file.path())
+                .drain_into_file(file.path())?
                 .expect("in-memory isn't empty");
 
             for _ in 0..5 {
-                let reader = file.read(8_192);
+                let reader = file.read(8_192)?;
                 assert_eq!(
                     reader
                         .last()
@@ -419,23 +444,25 @@ mod tests {
                         .timestamp(),
                     Timestamp(2)
                 );
-                file = reader.close();
+                file = reader.close()?;
             }
 
-            let mut reader = file.read(8_192);
-            reader.read_next();
-            reader.read_next();
-            reader.read_next();
+            let mut reader = file.read(8_192)?;
+            reader.read_next()?;
+            reader.read_next()?;
+            reader.read_next()?;
             assert!(reader.last().is_none());
+
+            Ok(())
         }
     }
 
     #[test]
-    fn process_a_few_records_in_buffer() {
-        let dir = tempfile::tempdir().unwrap();
+    fn process_a_few_records_in_buffer() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
         let output = dir.path().join("output");
-        let mut writer = output::Writer::open(&output).unwrap();
-        let mut reader = output::Reader::open(&output).unwrap();
+        let mut writer = output::Writer::open(&output)?;
+        let mut reader = output::Reader::open(&output)?;
         let mut sut = Buffer::new(
             dir.path(),
             &mut writer,
@@ -448,32 +475,34 @@ mod tests {
         sut.push_record(Record::A(DataA {
             timestamp: Timestamp(5),
             foo: "foo".to_owned(),
-        }));
+        }))?;
         sut.push_record(Record::A(DataA {
             timestamp: Timestamp(1),
             foo: "foo".to_owned(),
-        }));
+        }))?;
         sut.push_record(Record::A(DataA {
             timestamp: Timestamp(3),
             foo: "foo".to_owned(),
-        }));
+        }))?;
 
-        let DumpedCount(count) = sut.dump_safe(Timestamp(10));
+        let DumpedCount(count) = sut.dump_safe(Timestamp(10))?;
         assert_eq!(count, 3);
 
         assert_eq!(reader.read().unwrap().timestamp(), Timestamp(1));
         assert_eq!(reader.read().unwrap().timestamp(), Timestamp(3));
         assert_eq!(reader.read().unwrap().timestamp(), Timestamp(5));
         let _ = reader.read().unwrap_err();
+
+        Ok(())
     }
 
     #[test]
-    fn random_million_records_is_sorted() {
+    fn random_million_records_is_sorted() -> std::io::Result<()> {
         const RECORDS: usize = 1_000_000;
 
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("output");
-        let mut writer = output::Writer::open(&output).unwrap();
+        let mut writer = output::Writer::open(&output)?;
         let mut sut = Buffer::new(
             dir.path(),
             &mut writer,
@@ -492,19 +521,21 @@ mod tests {
                 ),
                 def: vec![],
             });
-            sut.push_record(record);
+            sut.push_record(record)?;
         }
 
-        let count = sut.dump_safe(Timestamp(RECORDS as u128));
+        let count = sut.dump_safe(Timestamp(RECORDS as u128))?;
         assert_eq!(count.0, RECORDS);
 
-        let mut reader = output::Reader::open(&output).unwrap();
-        let mut prev_ts = reader.read().unwrap().timestamp();
+        let mut reader = output::Reader::open(&output)?;
+        let mut prev_ts = reader.read()?.timestamp();
         for _ in 1..RECORDS {
-            let ts = reader.read().unwrap().timestamp();
+            let ts = reader.read()?.timestamp();
             assert!(prev_ts <= ts);
             prev_ts = ts;
         }
         reader.read().expect_err("there must be no records left");
+
+        Ok(())
     }
 }
